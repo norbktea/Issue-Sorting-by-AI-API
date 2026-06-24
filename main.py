@@ -1,244 +1,483 @@
-#####你可以教他一個 Notepad++ 的神技，不用切換到 CMD 也能跑程式：在 Notepad++ 按下 F5。在輸入框貼入這行：cmd /k python "$(FULL_CURRENT_PATH)"按下 「執行」。這會直接跳出黑視窗跑出結果，這就是「開發環境」的雛形！
-
+"""
+Issue Sorting by AI API — Driver IC / Tcon IC 客⼾回饋分類⼯具
+版本：2.0 重構重點：
+ - 非同步並⾏（asyncio + aiohttp）：同時處理多份檔案
+ - 結構化輸出（Pydantic）：鎖死 JSON 格式，欄位永遠對⿑
+ - AI ⾃動判斷 Issue 類別（不再 Python 寫死清單）
+ - 四家 API 對等⽀援：OpenAI / Grok / Claude / Gemini
+ - API Key 使⽤環境變數，不存純⽂字檔案
+依賴安裝（第⼀次執⾏前）：
+ pip install aiohttp pydantic tk pypdf extract-msg
+"""
+# ── 標準庫 ──────────────────────────────────────────────────────────────────
+import asyncio
+import json
 import os
 import sys
-import json
-import urllib.request
-import urllib.error
-import configparser
-
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-
-CONFIG_FILE = "config.txt"
-
-# 各大 AI API 的標準網址
-API_URLS = {
-    "ChatGPT": "https://openai.com",
-    "Grok": "https://x.ai",
-    "Claude": "https://anthropic.com",
-    "Gemini": "https://googleapis.com"
+from datetime import datetime
+from typing import Optional
+# ── 第三⽅套件 ───────────────────────────────────────────────────────────────
+try:
+ import aiohttp
+except ImportError:
+ print("請先執⾏：pip install aiohttp")
+ sys.exit(1)
+try:
+ from pydantic import BaseModel, Field
+except ImportError:
+ print("請先執⾏：pip install pydantic")
+ sys.exit(1)
+# ── PDF / MSG 解析（選配，缺少時改⽤純⽂字讀取）────────────────────────────
+try:
+ import pypdf
+ HAS_PYPDF = True
+except ImportError:
+ HAS_PYPDF = False
+try:
+ import extract_msg
+ HAS_MSG = True
+except ImportError:
+ HAS_MSG = False
+# ════════════════════════════════════════════════════════════════════════════
+# Pydantic 結構化輸出模型
+# ─── 這就是「格式鎖死」的核⼼。AI 必須回傳符合此結構的 JSON。
+# 欄位說明：
+# customer : 客⼾名稱（Samsung / Sony / Hisense / TPV / 其他）
+# issue_category: AI ⾃動判斷的 Issue 類型，不由 Python 寫死
+# deadline : 客⼾要求回覆 / 解決的 Deadline（字串，無則填 None）
+# root_cause : 初步原因推斷（AI 從內容摘要）
+# summary : ⼀句話摘要（選填，⽅便 UI 顯⽰）
+# ════════════════════════════════════════════════════════════════════════════
+class IssueReport(BaseModel):
+ customer: str = Field(description="客⼾名稱，例如 Samsung、Sony、Hisense、TPV 或 Unknown")
+ issue_category: str = Field(description="Issue 類別，由 AI 根據內容⾃由判斷，例如：Driver IC Timing Failure、Tcon IC 通訊異常、Display 閃爍、Color Deviation、ESD 損傷、Backlight 異常、其他")
+ deadline: Optional[str] = Field(default=None, description="客⼾要求的 deadline，無則為 null")
+ root_cause: str = Field(description="初步原因推斷，100 字以內")
+ summary: str = Field(description="⼀句話摘要，50 字以內")
+# ════════════════════════════════════════════════════════════════════════════
+# Prompt ⼯廠
+# ════════════════════════════════════════════════════════════════════════════
+SYSTEM_PROMPT = """你是⼀名資深 Display IC ⼯程師，專精於 Driver IC 與 Tcon IC 的客⼾品質回饋分析。
+你的任務是從客⼾提供的⽂件（可能是 email、PDF 報告、MSG 信件）中，擷取並結構化以下資訊：
+1. 客⼾名稱（Samsung、Sony、Hisense、TPV 等⾯板客⼾）
+2. Issue 類別 — 請根據內容⾃⾏判斷，不限於固定清單。常⾒類型包括：
+ Driver IC：Timing Failure、Init 失敗、SPI 通訊異常、過熱、ESD 損傷、Gamma 異常
+ Tcon IC：LVDS/eDP 信號異常、Dithering 問題、FRC 錯誤、Frame Sync 問題
+ Display 整體：閃爍（Flicker）、Color Deviation、Mura、Backlight 異常、Panel 壓傷
+ 其他：RMA 退貨、Spec 疑問、PCBA 焊接不良
+3. Deadline（客⼾要求回覆或解決的⽇期，若無則填 null）
+4. 初步原因推斷（根據⽂字內容合理推斷，非臆測）
+5. ⼀句話摘要
+請只輸出 JSON，格式完全符合以下結構，不要輸出任何額外⽂字：
+{
+ "customer": "...",
+ "issue_category": "...",
+ "deadline": "...",
+ "root_cause": "...",
+ "summary": "..."
+}"""
+def build_user_prompt(text: str) -> str:
+ return f"【⽂件內容】\n{text[:4000]}\n【請輸出 JSON 結果】"
+# ════════════════════════════════════════════════════════════════════════════
+# 各家 API 的非同步請求函式
+# 設計原則：每⼀家都⽤ aiohttp，回傳 IssueReport 或拋出例外
+# ════════════════════════════════════════════════════════════════════════════
+async def call_openai_compatible(
+ session: aiohttp.ClientSession,
+ base_url: str,
+ api_key: str,
+ model: str,
+ text: str,
+) -> IssueReport:
+ """
+ OpenAI 相容格式 — 適⽤於 ChatGPT 和 Grok
+ 
+ [非同步原理] ⽤ async/await 發送請求：
+ - 發出請求後立刻「讓出控制權」，讓其他任務也能跑
+ - 等 API 回應時不佔⽤ CPU，可同時處理其他檔案
+ 
+ [Pydantic 原理] response_format={"type": "json_object"} 強制回傳 JSON，
+ 再⽤ IssueReport.model_validate() 驗證欄位是否完整正確
+ """
+ payload = {
+ "model": model,
+ "messages": [
+ {"role": "system", "content": SYSTEM_PROMPT},
+ {"role": "user", "content": build_user_prompt(text)},
+ ],
+ "temperature": 0.0,
+ "response_format": {"type": "json_object"}, # 強制 JSON 輸出
+ }
+ headers = {
+ "Content-Type": "application/json",
+ "Authorization": f"Bearer {api_key}",
+ }
+ async with session.post(
+ f"{base_url}/chat/completions",
+ json=payload,
+ headers=headers,
+ timeout=aiohttp.ClientTimeout(total=30),
+ ) as resp:
+ resp.raise_for_status()
+ data = await resp.json()
+ raw_json = data["choices"][0]["message"]["content"]
+ return IssueReport.model_validate(json.loads(raw_json))
+async def call_claude(
+ session: aiohttp.ClientSession,
+ api_key: str,
+ text: str,
+) -> IssueReport:
+ """
+ Anthropic Claude — 使⽤ Messages API
+ 
+ [Claude 無原⽣ JSON mode] 因此在 Prompt 明確要求只回 JSON，
+ 再⽤ Pydantic 驗證。效果等同 OpenAI 的 json_object 模式。
+ """
+ payload = {
+ "model": "claude-opus-4-5",
+ "max_tokens": 512,
+ "system": SYSTEM_PROMPT,
+ "messages": [
+ {"role": "user", "content": build_user_prompt(text)},
+ ],
+ "temperature": 0.0,
+ }
+ headers = {
+ "Content-Type": "application/json",
+ "X-API-Key": api_key,
+ "anthropic-version": "2023-06-01",
+ }
+ async with session.post(
+ "https://api.anthropic.com/v1/messages",
+ json=payload,
+ headers=headers,
+ timeout=aiohttp.ClientTimeout(total=30),
+ ) as resp:
+ resp.raise_for_status()
+ data = await resp.json()
+ raw_text = data["content"][0]["text"].strip()
+ # 防禦：有時 Claude 會在 JSON 前後多輸出說明⽂字，嘗試擷取 {}
+ start = raw_text.find("{")
+ end = raw_text.rfind("}") + 1
+ raw_json = raw_text[start:end]
+ return IssueReport.model_validate(json.loads(raw_json))
+async def call_gemini(
+ session: aiohttp.ClientSession,
+ api_key: str,
+ text: str,
+) -> IssueReport:
+ """
+ Google Gemini — 使⽤ generateContent API
+ 
+ [Key 位置修正] 原版把 Key 放在 URL，有洩漏風險。
+ 本版改放 Header x-goog-api-key，更安全。
+ [JSON mode] 使⽤ responseMimeType 強制 JSON 輸出。
+ """
+ payload = {
+ "contents": [
+ {
+ "parts": [
+ {"text": SYSTEM_PROMPT + "\n\n" + build_user_prompt(text)}
+ ]
+ }
+ ],
+ "generationConfig": {
+ "temperature": 0.0,
+ "responseMimeType": "application/json", # Gemini 原⽣ JSON mode
+ },
+ }
+ headers = {
+ "Content-Type": "application/json",
+ "x-goog-api-key": api_key, # Key 放 Header，不放 URL
+ }
+ async with session.post(
+ "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+ json=payload,
+ headers=headers,
+ timeout=aiohttp.ClientTimeout(total=30),
+ ) as resp:
+ resp.raise_for_status()
+ data = await resp.json()
+ raw_json = data["candidates"][0]["content"]["parts"][0]["text"]
+ return IssueReport.model_validate(json.loads(raw_json))
+# ════════════════════════════════════════════════════════════════════════════
+# 統⼀入⼝：根據 provider 分派到對應函式
+# ════════════════════════════════════════════════════════════════════════════
+async def classify_issue(provider: str, text: str, api_key: str) -> IssueReport | str:
+ """
+ 回傳 IssueReport（成功）或錯誤字串（失敗）
+ 
+ [asyncio.gather ⽤法]
+ 外部可以這樣同時處理多個檔案：
+ results = await asyncio.gather(
+ classify_issue(provider, text1, key),
+ classify_issue(provider, text2, key),
+ classify_issue(provider, text3, key),
+ return_exceptions=True
+ )
+ 三個 API 請求會同時發出，總等待時間約等於最慢那⼀個，⽽非三倍。
+ """
+ async with aiohttp.ClientSession() as session:
+ try:
+ if provider == "ChatGPT":
+ return await call_openai_compatible(
+ session, "https://api.openai.com/v1", api_key, "gpt-4o-mini", text
+ )
+ elif provider == "Grok":
+ return await call_openai_compatible(
+ session, "https://api.x.ai/v1", api_key, "grok-2-1212", text
+ )
+ elif provider == "Claude":
+ return await call_claude(session, api_key, text)
+ elif provider == "Gemini":
+ return await call_gemini(session, api_key, text)
+ else:
+ return " 未知的 AI 供應商"
+ except aiohttp.ClientResponseError as e:
+ if e.status == 429:
+ return " QUOTA_EXCEEDED"
+ return f" HTTP 錯誤 {e.status}: {e.message}"
+ except json.JSONDecodeError:
+ return " AI 回傳格式錯誤，無法解析 JSON"
+ except Exception as e:
+ return f" 系統錯誤: {e}"
+# ════════════════════════════════════════════════════════════════════════════
+# 檔案⽂字擷取
+# ════════════════════════════════════════════════════════════════════════════
+def extract_text(file_path: str) -> str:
+ ext = os.path.splitext(file_path)[1].lower()
+ if ext == ".pdf":
+ if HAS_PYPDF:
+ try:
+ reader = pypdf.PdfReader(file_path)
+ return "\n".join(page.extract_text() or "" for page in reader.pages)
+ except Exception as e:
+ return f"[PDF 解析失敗] {e}"
+ else:
+ # fallback：強制讀取，PDF ⼆進位通常包含部分可讀⽂字
+ try:
+ with open(file_path, "rb") as f:
+ raw = f.read()
+ return raw.decode("utf-8", errors="ignore")
+ except Exception as e:
+ return f"[PDF 讀取失敗] {e}"
+ elif ext == ".msg":
+ if HAS_MSG:
+ try:
+ msg = extract_msg.Message(file_path)
+ parts = [
+ f"Subject: {msg.subject or ''}",
+ f"From: {msg.sender or ''}",
+ f"Date: {msg.date or ''}",
+ f"Body:\n{msg.body or ''}",
+ ]
+ return "\n".join(parts)
+ except Exception as e:
+ return f"[MSG 解析失敗] {e}"
+ else:
+ try:
+ with open(file_path, "rb") as f:
+ return f.read().decode("utf-8", errors="ignore")
+ except Exception as e:
+ return f"[MSG 讀取失敗] {e}"
+ else:
+ # 純⽂字類型（.txt, .eml 等）
+ for enc in ["utf-8", "cp950", "latin-1"]:
+ try:
+ with open(file_path, "r", encoding=enc, errors="ignore") as f:
+ return f.read()
+ except Exception:
+ continue
+ return "[無法讀取此檔案]"
+# ════════════════════════════════════════════════════════════════════════════
+# API Key 管理 — 優先使⽤環境變數（比 config.txt 安全）
+# ════════════════════════════════════════════════════════════════════════════
+ENV_KEY_MAP = {
+ "ChatGPT": "OPENAI_API_KEY",
+ "Grok": "GROK_API_KEY",
+ "Claude": "ANTHROPIC_API_KEY",
+ "Gemini": "GEMINI_API_KEY",
 }
-
-def get_api_config(provider):
-    """從外部 config.txt 安全讀取指定 AI 的金鑰"""
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(current_dir, CONFIG_FILE)
-    
-    if not os.path.exists(config_path):
-        return None, f"❌ 找不到設定檔：{CONFIG_FILE}\n請在程式旁建立此檔案。"
-        
-    try:
-        config = configparser.ConfigParser()
-        config.read(config_path, encoding="utf-8")
-        
-        section = "API_SETTINGS"
-        key_name = f"{provider.upper()}_API_KEY"
-        
-        if section in config and key_name in config[section]:
-            api_key = config[section][key_name].strip()
-            if not api_key or "your" in api_key or "請填入" in api_key:
-                return None, f"❌ {key_name} 內容為空或尚未修改，請檢查 config.txt。"
-            return api_key, None
-        else:
-            return None, f"❌ config.txt 格式錯誤，必須包含 [{section}] 與 {key_name}。"
-    except Exception as e:
-        return None, f"❌ 讀取設定檔失敗: {e}"
-
-
-def extract_text_pure_python(file_path):
-    """100% 純 Python 讀取檔案（免套件）"""
-    try:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-        if len(content.strip()) < 10:
-            with open(file_path, "r", encoding="cp950", errors="ignore") as f:
-                content = f.read()
-        return content
-    except Exception as e:
-        return f"[檔案讀取錯誤] {e}"
-
-
-def build_payload_and_headers(provider, text, api_key):
-    """根據不同的 AI 供應商，封裝對應的請求格式與 Header"""
-    truncated_text = text[:3000]
-    prompt = (
-        "你是一個 IT 系統的 Issue 分類專家。請仔細閱讀以下由 PDF 或 MSG 檔案中提取出來的文字內容，"
-        "並嚴格從以下四個類別中選擇一個最符合的分類填入：\n"
-        "1. 🐛 Bug / 程式錯誤\n"
-        "2. 💡 Feature Request / 新功能需求\n"
-        "3. 💰 Billing / 財務帳務\n"
-        "4. 📂 Unclassified / 其他未分類\n\n"
-        "請直接回傳該分類的完整名稱即可（例如：'🐛 Bug / 程式錯誤'），不需要任何額外的解釋或前言。\n\n"
-        f"【檔案內容開始】\n{truncated_text}\n【檔案內容結束】"
-    )
-
-    url = API_URLS[provider]
-
-    if provider in ["ChatGPT", "Grok"]:
-        # OpenAI 與 xAI Grok 的格式通用
-        model = "gpt-4o-mini" if provider == "ChatGPT" else "grok-2-1212"
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.0
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
-    elif provider == "Claude":
-        # Anthropic Claude 專有格式
-        payload = {
-            "model": "claude-3-5-sonnet-latest",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.0
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "X-API-Key": api_key,
-            "anthropic-version": "2023-06-01"
-        }
-    elif provider == "Gemini":
-        # Google Gemini 專有格式，Key 帶在 URL 後方
-        url = f"{url}?key={api_key}"
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.0}
-        }
-        headers = {"Content-Type": "application/json"}
-
-    return url, json.dumps(payload).encode("utf-8"), headers
-
-
-def parse_ai_success_response(provider, res_body):
-    """解析各家 AI 成功回傳的 JSON"""
-    res_json = json.loads(res_body)
-    if provider in ["ChatGPT", "Grok"]:
-        return res_json["choices"][0]["message"]["content"].strip()
-    elif provider == "Claude":
-        return res_json["content"][0]["text"].strip()
-    elif provider == "Gemini":
-        return res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-    return "📂 Unclassified / 其他未分類"
-
-
-def classify_issue_via_multi_ai(provider, text, api_key):
-    """核心請求：向指定 AI 發送請求，並嚴密攔截各大廠商的超支/額度用盡報錯"""
-    url, data, headers = build_payload_and_headers(provider, text, api_key)
-    
-    try:
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=15) as response:
-            res_body = response.read().decode("utf-8")
-            return parse_ai_success_response(provider, res_body)
-
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8")
-        try:
-            err_data = json.loads(error_body)
-            
-            # 🟢 [ChatGPT & Grok 攔截] 檢查 HTTP 429 且代碼包含 insufficient_quota
-            if provider in ["ChatGPT", "Grok"]:
-                err_code = err_data.get("error", {}).get("code", "")
-                err_msg = err_data.get("error", {}).get("message", "")
-                if "quota" in err_code or "quota" in err_msg or e.code == 429:
-                    return "🛑 QUOTA_EXCEEDED"
-                    
-            # 🟢 [Claude 攔截] 檢查 Anthropic 的 rate_limit_error 與超額描述
-            elif provider == "Claude":
-                err_type = err_data.get("error", {}).get("type", "")
-                err_msg = err_data.get("error", {}).get("message", "")
-                if "rate_limit" in err_type or "quota" in err_msg or e.code == 429:
-                    return "🛑 QUOTA_EXCEEDED"
-                    
-            # 🟢 [Gemini 攔截] 檢查 Google 的 RESOURCE_EXHAUSTED 狀態
-            elif provider == "Gemini":
-                err_status = err_data.get("error", {}).get("status", "")
-                err_msg = err_data.get("error", {}).get("message", "")
-                if "EXHAUSTED" in err_status or "quota" in err_msg or e.code == 429:
-                    return "🛑 QUOTA_EXCEEDED"
-        except:
-            pass
-        return f"❌ 網路請求失敗 (HTTP {e.code})"
-    except urllib.error.URLError as e:
-        return f"❌ 連線失敗，可能遭防火牆封鎖\n原因: {e}"
-    except Exception as e:
-        return f"❌ 系統錯誤: {e}"
-
-
-def select_and_process_file():
-    """按鈕點擊觸發邏輯"""
-    provider = combo_provider.get() # 取得使用者在 UI 選取的 AI 廠商
-    
-    api_key, err = get_api_config(provider)
-    if err:
-        messagebox.showerror("設定錯誤", err)
-        return
-
-    file_path = filedialog.askopenfilename(
-        title="請選擇要分類的檔案",
-        filetypes=[("支援的檔案", "*.pdf *.msg"), ("All Files", "*.*")]
-    )
-    if not file_path:
-        return
-
-    lbl_file_path.config(text=f"已選取檔案：{os.path.basename(file_path)}")
-    lbl_result.config(text=f"🤖 {provider} 正在安全分類中...", fg="orange")
-    root.update()
-
-    content = extract_text_pure_python(file_path)
-    if "[檔案讀取錯誤]" in content:
-        messagebox.showerror("解析失敗", content)
-        lbl_result.config(text="解析失敗", fg="red")
-        return
-
-    # 執行 AI 分類
-    category = classify_issue_via_multi_ai(provider, content, api_key)
-    
-    # 🟢 萬流歸宗：不論哪一家超支，一律當場鎖死 UI 按鈕！
-    if category == "🛑 QUOTA_EXCEEDED":
-        lbl_result.config(text="API 額度已耗盡，停止服務", fg="red")
-        btn_select.config(state=tk.DISABLED)
-        messagebox.showerror("費用超額警告", f"您的 {provider} 免費 Token 或預算額度已用完！\n系統已自動關閉分類按鈕，以防產生額外費用。")
-    elif "❌" in category:
-        lbl_result.config(text="分類失敗", fg="red")
-        messagebox.showerror("AI 分類失敗", category)
-    else:
-        lbl_result.config(text=category, fg="green")
-
-
-# --- UI 介面建立 ---
-root = tk.Tk()
-root.title("Issue Sorting by AI API (多雲防刷費版)")
-root.geometry("500x360")
-root.resizable(False, False)
-
-lbl_title = tk.Label(root, text="多雲智慧 AI 語意分類器", font=("Arial", 16, "bold"))
-lbl_title.pack(pady=15)
-
-# 新增：下拉選單選取 AI 供應商
-frame_provider = tk.Frame(root)
-frame_provider.pack(pady=5)
-lbl_choose = tk.Label(frame_provider, text="請選擇 AI 引擎：", font=("Arial", 10))
-lbl_choose.pack(side=tk.LEFT)
-
-combo_provider = ttk.Combobox(frame_provider, values=["ChatGPT", "Grok", "Claude", "Gemini"], state="readonly", width=15)
-combo_provider.current(0) # 預設選 ChatGPT
-combo_provider.pack(side=tk.LEFT)
-
-# 檔案選擇按鈕
-btn_select = tk.Button(root, text="選擇檔案 (.pdf / .msg)", command=select_and_process_file, font=("Arial", 12))
-btn_select.pack(pady=15)
-
-lbl_file_path = tk.Label(root, text="尚未選取任何檔案", font=("Arial", 10), fg="gray")
-lbl_file_path.pack(pady=5)
-
-lbl_res_title = tk.Label(root, text="【 AI 分類結果 】", font=("Arial", 12, "bold"))
-lbl_res_title.pack(pady=(15, 5))
-
-lbl_result = tk.Label(root, text="請先選取檔案", font=("Arial", 14), fg="blue")
-lbl_result.pack()
-
-root.mainloop()
+def get_api_key(provider: str) -> tuple[str | None, str | None]:
+ """
+ 依序嘗試：環境變數 → config.txt
+ 回傳 (key, error_message)
+ """
+ env_name = ENV_KEY_MAP.get(provider, "")
+ key = os.environ.get(env_name, "").strip()
+ if key:
+ return key, None
+ # Fallback：讀 config.txt（與程式同⽬錄）
+ config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.txt")
+ if os.path.exists(config_path):
+ import configparser
+ cfg = configparser.ConfigParser()
+ cfg.read(config_path, encoding="utf-8")
+ section = "API_SETTINGS"
+ key_name = f"{provider.upper()}_API_KEY"
+ if section in cfg and key_name in cfg[section]:
+ key = cfg[section][key_name].strip()
+ if key and "your" not in key and "請填入" not in key:
+ return key, None
+ return None, (
+ f"找不到 {provider} 的 API Key。\n\n"
+ f"請在系統環境變數中設定 {env_name}，\n"
+ f"或在 config.txt 的 [API_SETTINGS] 加入 {provider.upper()}_API_KEY=..."
+ )
+# ════════════════════════════════════════════════════════════════════════════
+# Tkinter UI
+# ════════════════════════════════════════════════════════════════════════════
+class App(tk.Tk):
+ def __init__(self):
+ super().__init__()
+ self.title("Driver IC / Tcon IC Issue 分類器 v2.0")
+ self.geometry("620x580")
+ self.resizable(False, False)
+ self.configure(bg="#1e2330")
+ self._build_ui()
+ def _build_ui(self):
+ PAD = {"padx": 20, "pady": 6}
+ # 標題
+ tk.Label(
+ self,
+ text="Driver IC / Tcon IC Issue 分類器",
+ font=("Arial", 15, "bold"),
+ fg="#a8d8ff",
+ bg="#1e2330",
+ ).pack(pady=(20, 4))
+ tk.Label(
+ self,
+ text="⽀援 PDF / MSG · AI ⾃動分析 · 非同步並⾏處理",
+ font=("Arial", 9),
+ fg="#7a8aaa",
+ bg="#1e2330",
+ ).pack(pady=(0, 14))
+ # AI 選擇
+ frm = tk.Frame(self, bg="#1e2330")
+ frm.pack(**PAD)
+ tk.Label(frm, text="AI 引擎：", font=("Arial", 11), fg="#c8d8f0", bg="#1e2330").pack(side=tk.LEFT)
+ self.combo = ttk.Combobox(
+ frm,
+ values=["ChatGPT", "Grok", "Claude", "Gemini"],
+ state="readonly",
+ width=14,
+ font=("Arial", 11),
+ )
+ self.combo.current(0)
+ self.combo.pack(side=tk.LEFT, padx=8)
+ # 選擇按鈕
+ self.btn = tk.Button(
+ self,
+ text="選擇檔案並分析 (.pdf / .msg)",
+ font=("Arial", 12, "bold"),
+ bg="#2a7fff",
+ fg="white",
+ activebackground="#1a5fcc",
+ relief=tk.FLAT,
+ padx=16,
+ pady=8,
+ command=self._on_click,
+ )
+ self.btn.pack(pady=14)
+ self.lbl_file = tk.Label(self, text="尚未選取檔案", font=("Arial", 10), fg="#7a8aaa", bg="#1e2330")
+ self.lbl_file.pack()
+ # 分隔線
+ tk.Frame(self, height=1, bg="#2e3a50").pack(fill=tk.X, padx=20, pady=14)
+ # 結果欄位
+ fields = [
+ ("客⼾", "lbl_customer"),
+ ("Issue 類別", "lbl_category"),
+ ("Deadline", "lbl_deadline"),
+ ("初步原因", "lbl_rootcause"),
+ ("摘要", "lbl_summary"),
+ ]
+ for label_text, attr in fields:
+ row = tk.Frame(self, bg="#1e2330")
+ row.pack(fill=tk.X, padx=24, pady=3)
+ tk.Label(
+ row,
+ text=f"{label_text}：",
+ font=("Arial", 10, "bold"),
+ fg="#7fb8ff",
+ bg="#1e2330",
+ width=10,
+ anchor="w",
+ ).pack(side=tk.LEFT)
+ lbl = tk.Label(
+ row,
+ text="—",
+ font=("Arial", 10),
+ fg="#d0ddf0",
+ bg="#1e2330",
+ anchor="w",
+ wraplength=400,
+ justify=tk.LEFT,
+ )
+ lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+ setattr(self, attr, lbl)
+ # 狀態列
+ self.lbl_status = tk.Label(
+ self,
+ text="就緒",
+ font=("Arial", 10, "italic"),
+ fg="#7a8aaa",
+ bg="#1e2330",
+ )
+ self.lbl_status.pack(pady=(16, 4))
+ def _set_status(self, text: str, color: str = "#7a8aaa"):
+ self.lbl_status.config(text=text, fg=color)
+ self.update()
+ def _clear_result(self):
+ for attr in ("lbl_customer", "lbl_category", "lbl_deadline", "lbl_rootcause", "lbl_summary"):
+ getattr(self, attr).config(text="—")
+ def _show_result(self, report: IssueReport):
+ self.lbl_customer.config(text=report.customer)
+ self.lbl_category.config(text=report.issue_category)
+ self.lbl_deadline.config(text=report.deadline or "未提及")
+ self.lbl_rootcause.config(text=report.root_cause)
+ self.lbl_summary.config(text=report.summary)
+ def _on_click(self):
+ provider = self.combo.get()
+ api_key, err = get_api_key(provider)
+ if err:
+ messagebox.showerror("API Key 錯誤", err)
+ return
+ file_path = filedialog.askopenfilename(
+ title="選擇 Issue 檔案",
+ filetypes=[("⽀援格式", "*.pdf *.msg"), ("All Files", "*.*")],
+ )
+ if not file_path:
+ return
+ self.lbl_file.config(text=f"已選取：{os.path.basename(file_path)}", fg="#a8d8ff")
+ self._clear_result()
+ self._set_status(f" {provider} 分析中…", "#f5a623")
+ self.btn.config(state=tk.DISABLED)
+ # asyncio 在 Tkinter 主執⾏緒中執⾏（避免 threading 複雜度）
+ async def run():
+ text = extract_text(file_path)
+ if text.startswith("["): # 讀取失敗
+ return text
+ return await classify_issue(provider, text, api_key)
+ result = asyncio.run(run()) # 單檔案版本，直接 run
+ self.btn.config(state=tk.NORMAL)
+ if isinstance(result, str):
+ if result == " QUOTA_EXCEEDED":
+ self._set_status("API 額度已耗盡", "red")
+ self.btn.config(state=tk.DISABLED)
+ messagebox.showerror("超額警告", f"{provider} 的額度已⽤完，已停⽌服務。")
+ else:
+ self._set_status(result, "red")
+ messagebox.showerror("分析失敗", result)
+ elif isinstance(result, IssueReport):
+ self._show_result(result)
+ self._set_status(" 分析完成", "#4caf50")
+ else:
+ self._set_status(" 未知錯誤", "red")
+# ════════════════════════════════════════════════════════════════════════════
+# 進入點
+# ════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+ app = App()
+ app.mainloop()
